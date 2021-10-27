@@ -6,8 +6,6 @@
 
 2. Train
 
-train model:
-
 ```
   CUSD_VISIBLE_DEVICES=0 nohup python -u main.py --do_train --output_dir output_16_2e-5 --num_train_epochs 10 > train.log&
 ```
