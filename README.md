@@ -18,6 +18,8 @@
 
 hfl/chinese-roberta-wwm-ext + Fully Connected Layer
 
+hfl/chinese-roberta-wwm-ext + TextCNN
+
 3. Train
 
 ```
