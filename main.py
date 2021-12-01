@@ -11,8 +11,9 @@ from torch.nn import CrossEntropyLoss
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertConfig, BertTokenizer, BertModel
 from transformers import (AdamW, WEIGHTS_NAME, CONFIG_NAME)
+from pytorchtools import EarlyStopping
 
-from model import BertClassify
+from model import BertClassify, Bert_Blend_CNN
 from tqdm import tqdm, trange
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,10 @@ if __name__ == '__main__':
                         default=768,
                         type=int,
                         help='Hidden size')
+    parser.add_argument('--num_filters',
+                        default=3,
+                        type=int,
+                        help='Num filters')
     parser.add_argument('--num_train_epochs',
                         default=10,
                         type=int,
@@ -186,7 +191,7 @@ if __name__ == '__main__':
     label_size = len(label_list)
     id2label = {idx: label for idx, label in enumerate(label_list)}
 
-    config = BertConfig.from_pretrained(args.pretrained_model)
+    config = BertConfig.from_pretrained(args.pretrained_model, output_hidden_states=True)
     tokenizer = BertTokenizer.from_pretrained(args.pretrained_model)
     albert = BertModel.from_pretrained(args.pretrained_model, config=config)
 
@@ -194,10 +199,16 @@ if __name__ == '__main__':
     num_train_optimization_steps = None
     data_processor = DataProcessor()
 
-    model = BertClassify(bert=albert,
+    # model = BertClassify(bert=albert,
+    #                      label_size=label_size,
+    #                      hidden_size=config.hidden_size,
+    #                      hidden_dropout_prob=args.dropout)
+
+    model = Bert_Blend_CNN(bert=albert,
                          label_size=label_size,
                          hidden_size=config.hidden_size,
-                         hidden_dropout_prob=args.dropout)
+                         num_hidden_layers=config.num_hidden_layers,
+                         num_filters=args.num_filters)
 
     model.to(device)
 
@@ -234,6 +245,9 @@ if __name__ == '__main__':
                                       shuffle=True)
 
         optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+
+        # initialize the early_stopping object
+        early_stopping = EarlyStopping(patience=3, verbose=True)
 
         for epoch in trange(args.num_train_epochs, desc="Epoch"):
             model.train()
@@ -301,7 +315,6 @@ if __name__ == '__main__':
             result['global_step'] = global_step
             result['loss'] = loss
 
-
             output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
             with open(output_eval_file, "a") as writer:
                 logger.info("***** Eval result *****")
@@ -309,15 +322,24 @@ if __name__ == '__main__':
                     print("%s = %s" % (key, str(result[key])))
                     logger.info("%s = %s", key, str(result[key]))
                     writer.write("%s = %s \n" % (key, str(result[key])))
+
             if result['accuracy'] > best_acc:
                 best_acc = result['accuracy']
-                output_model_file = os.path.join(args.output_dir,
-                                                 "best_model_" + str(args.pretrained_model).split('/')[-1] + WEIGHTS_NAME)
-                output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+            output_model_file = os.path.join(args.output_dir,
+                                             str(epoch) + "_"\
+                                             + str(result['accuracy']) + '_'\
+                                             + str(args.pretrained_model).split('/')[-1] \
+                                             + WEIGHTS_NAME)
+            #output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
 
-                torch.save(model.state_dict(), output_model_file)
-                # model.config.to_json_file(output_config_file)
-                # tokenizer.save_vocabulary(args.output_dir)
+            torch.save(model.state_dict(), output_model_file)
+            # model.config.to_json_file(output_config_file)
+            # tokenizer.save_vocabulary(args.output_dir)
+
+            early_stopping(eval_loss, model)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
 
     if args.do_test:
         if not args.result_path:
@@ -337,34 +359,48 @@ if __name__ == '__main__':
                                       shuffle=False)
 
         print('Loading model...')
-        output_model_file = os.path.join(args.output_dir,
-                                         "best_model_" + str(args.pretrained_model).split('/')[-1] + WEIGHTS_NAME)
-        checkpoint = torch.load(output_model_file)
-        #print('checkpoint>>', checkpoint)
-        model.load_state_dict(checkpoint)
-        print('Start to test...')
-        model.eval()
-        preds = None
-        for batch in tqdm(test_dataloader, desc="Testing"):
-            batch = tuple(p.to(device) for p in batch)
+        # output_model_file = os.path.join(args.output_dir,
+                                        # "best_model_" + str(args.pretrained_model).split('/')[-1] + WEIGHTS_NAME)
+        # output_model_file = 'output_16_2e-5_20/19_0.995975_chinese-roberta-wwm-extpytorch_model.bin'
 
-            with torch.no_grad():
-                inputs = {
-                    'input_ids': torch.squeeze(batch[0], dim=1),
-                    'attention_mask': torch.squeeze(batch[1], dim=1),
-                    'token_type_ids': torch.squeeze(batch[2], dim=1)
-                    # 'labels': batch[3]
-                }
-                logits = model(**inputs)
-            if preds is None:
-                preds = logits.detach().cpu().numpy()
-            else:
-                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-        assert len(test_examples) == len(preds)
-        pred_labels = np.argmax(preds, axis=1)
+        ensemble_files = ['18_0.9960625_chinese-roberta-wwm-extpytorch_model.bin',
+                          '17_0.995325_chinese-roberta-wwm-extpytorch_model.bin',
+                          '16_0.9957625_chinese-roberta-wwm-extpytorch_model.bin',
+                          '15_0.99605_chinese-roberta-wwm-extpytorch_model.bin',
+                          '13_0.995775_chinese-roberta-wwm-extpytorch_model.bin']
+
+        total_preds = []
+        for file in ensemble_files:
+            output_model_file = os.path.join(args.output_dir, file)
+
+            checkpoint = torch.load(output_model_file)
+            #print('checkpoint>>', checkpoint)
+            model.load_state_dict(checkpoint)
+            print('Start to test...{}'.format(file))
+            model.eval()
+            preds = None
+            for batch in tqdm(test_dataloader, desc="Testing"):
+                batch = tuple(p.to(device) for p in batch)
+
+                with torch.no_grad():
+                    inputs = {
+                        'input_ids': torch.squeeze(batch[0], dim=1),
+                        'attention_mask': torch.squeeze(batch[1], dim=1),
+                        'token_type_ids': torch.squeeze(batch[2], dim=1)
+                        # 'labels': batch[3]
+                    }
+                    logits = model(**inputs)
+                if preds is None:
+                    preds = logits.detach().cpu().numpy()
+                else:
+                    preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+            assert len(test_examples) == len(preds)
+            total_preds.append(preds)
+        total_pred = sum(total_preds) / len(total_preds)
+        pred_labels = np.argmax(total_pred, axis=1)
         print('pred_labels size>>', len(pred_labels))
 
         with open(args.result_path, 'w') as writer:
             for label_id in pred_labels:
                 writer.writelines(id2label[label_id] + '\n')
-        print('Test result saved to {}'.format(result_path))
+        print('Test result saved to {}'.format(args.result_path))
